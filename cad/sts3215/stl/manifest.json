@@ -1,5 +1,6 @@
 {
  "trunk": "trunk",
+ "battery_tray": "trunk",
  "neck": "neck",
  "neck_top": "neck_top",
  "head_yaw_link": "head_yaw_link",

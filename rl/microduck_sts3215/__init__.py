@@ -11,3 +11,13 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{__name__}.agents:Sts3215PPORunnerCfg",
     },
 )
+
+gym.register(
+    id="Microduck-STS3215-Velocity-Flat-Turn",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.env_cfg:Sts3215TurnVelocityFlatEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents:Sts3215TurnPPORunnerCfg",
+    },
+)

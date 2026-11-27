@@ -176,3 +176,20 @@ class Sts3215VelocityFlatEnvCfg(MicroDuckVelocityFlatEnvCfg):
             },
         )
         self.events.push_robot.params["velocity_range"] = {"x": (-0.2, 0.2), "y": (-0.2, 0.2)}
+
+
+@configclass
+class Sts3215TurnVelocityFlatEnvCfg(Sts3215VelocityFlatEnvCfg):
+    """Same task, aimed at the commands the first BAM policy ignores: turning, and walking while turning.
+
+    A wider yaw range than the base task's +-0.6 rad/s gives the policy margin past the target, less reversing puts
+    more of the samples into walking while turning, and fewer standing episodes leave more time on moving commands.
+    These numbers are starting values, not tuned.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        cmd = self.commands.base_velocity
+        cmd.ranges.ang_vel_z = (-0.8, 0.8)
+        cmd.ranges.lin_vel_x = (-0.05, 0.25)
+        cmd.rel_standing_envs = 0.1

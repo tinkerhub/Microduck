@@ -46,6 +46,21 @@ CRADLE_FRONT = -5.0  # cradle side walls reach this far forward (servo x); the s
 YAW_CLIP_R = 22.0   # inner side of the hip yaw link stays inside this radius (yaw axes are 45.6 apart)
 SHIN_TOP_R = 21.0   # shin stays inside this radius of the knee axis above the ankle cradle
 
+# battery tray on the back of the trunk: 2S pack of two 18650 cells lying across (along y), stacked in z
+CELL_D, CELL_L = 18.5, 65.5   # bare 18650 (no protection board; the BMS goes outside the tray)
+CELL_CLR = 0.4                # cell-to-pocket clearance
+POCKET_L = CELL_L + 1.5       # room for the nickel strip and the balance leads at the ends
+TRAY_WALL = 2.0
+TRAY_PLATE = 3.0              # front plate against the trunk's back face
+LIP_T = 2.5                   # hook lip resting on the trunk deck
+M2_HEAD = (4.2, 1.8)          # counterbore for an M2 pan head: diameter, depth
+BOARD_HOLES = (58.0, 23.0)    # controller mounting pattern on the tray's back (Raspberry Pi Zero size, assumed)
+BOSS = (6.0, 5.0)             # board standoff boss: diameter, height
+TRAY_LAYOUT = "flat"          # "flat": cells along y, side by side in x; "across": cells along y, stacked in z; "upright": cells along z, side by side in y
+TRAY_DZ = -8.0                # pocket top relative to the deck top (negative: below it)
+TRAY_BOT_CHAMFER = 5.0        # 45 deg chamfer on the bottom outer edges (thigh clearance in hip yaw + roll)
+TRAY_TOP_CHAMFER = 7.0        # 45 deg chamfer on the top back edge (head clearance with the neck tipped back)
+
 
 def box(lo, hi, R=np.eye(3), T=None):
     """Box from corners lo/hi given in the frame (R, T) -- world if T is None."""
@@ -147,6 +162,14 @@ def chamfer_y(x, z, y0, y1, leg):
     return q
 
 
+def chamfer_x(y, z, x0, x1, leg):
+    """Cut a 45 deg chamfer with legs ``leg`` on an edge along x at (y, z)."""
+    c, h = np.sqrt(0.5), leg / np.sqrt(2)
+    q = box((x0, -h, -h), (x1, h, h), R=np.array([[1, 0, 0], [0, c, -c], [0, c, c]]))
+    q["c"] = [(x0 + x1) / 2, y, z]
+    return q
+
+
 def part(name, link, *groups, cuts=(), clip=()):
     """(union of solids - cuts), intersected with the union of ``clip`` if given."""
     solids, cc = [], list(cuts)
@@ -243,6 +266,73 @@ def left_leg():
     return parts
 
 
+def battery_tray(back_x, bridge_hw, bridge_z0, bridge_z1, deck_top):
+    """Tray for the 2S pack, hung on the trunk's back face: a front plate screwed into the solid bridge between the
+    hip yaw servos (4 x M2 self-tapping), a lip hooked over the deck, an open-top pocket for the two cells and a
+    floor with two slots for a hook-and-loop strap over the cells. In the taller layouts, bosses on the back carry
+    the controller board. Returns (solids, cuts, pilot cuts for the trunk).
+
+    The space behind the trunk is squeezed from two sides: below about z 160 the thighs come in at combined hip
+    yaw and roll, and above the deck the head comes down when the neck tips back with the head pitched back. The
+    flat layout (one layer, 8 mm below the deck) sits in the gap between them; see the README for what still
+    collides."""
+    X = (1, 0, 0)
+    f0, f1 = back_x - TRAY_PLATE, back_x                       # front plate
+    px1 = f0                                                    # pocket, front
+    cell = CELL_D + 2 * CELL_CLR
+    nx = 1                                                      # cells side by side in x
+    if TRAY_LAYOUT == "upright":                                # cells standing, side by side in y
+        hw, depth = cell, POCKET_L - 2.0                        # the cells stand 2 mm proud, to grip them
+        board = BOARD_HOLES[::-1]
+    elif TRAY_LAYOUT == "flat":                                 # cells lying across (y), side by side in x
+        hw, depth, nx = POCKET_L / 2, cell - 1.0, 2             # they stand 1 mm proud
+        board = BOARD_HOLES
+    else:                                                       # cells lying across (y), stacked in z
+        hw, depth = POCKET_L / 2, 2 * cell - 1.0                # the top one stands 1 mm proud
+        board = BOARD_HOLES
+    px0 = px1 - nx * cell                                       # pocket, back
+    bx0 = px0 - TRAY_WALL                                       # back wall
+    ow = hw + TRAY_WALL
+    pz1 = deck_top + TRAY_DZ                                    # pocket top, level with the deck unless raised
+    pz0 = pz1 - depth
+    fz0 = pz0 - TRAY_WALL
+    solids = [box((bx0, -ow, fz0), (f1, ow, pz1)),                                  # block, pocket cut below
+              box((f0, -15.0, deck_top), (back_x + 7.0, 15.0, deck_top + LIP_T)),     # lip over the deck
+              box((f0, -15.0, pz1), (f1, 15.0, deck_top + LIP_T))]                  # plate up to the lip
+    cuts = [box((px0, -hw, pz0), (px1, hw, pz1 + 1))]                               # pocket
+    # strap slots through the floor, just behind the front plate
+    cuts += [box((px1 - 3.0, sy * 3.0, fz0 - 1), (px1 - 0.5, sy * (hw - 3.0), pz0 + 1)) for sy in (1, -1)]
+    # 45 deg chamfers on the front outer vertical edges: the trunk's matching chamfers leave room for a thigh corner
+    c45, h = np.sqrt(0.5), 4.0 / np.sqrt(2)                      # 4 mm legs: keeps the pocket corner walled
+    for sy in (1, -1):
+        q = box((-h, -h, fz0 - 1), (h, h, pz1 + 1), R=np.array([[c45, -c45, 0], [c45, c45, 0], [0, 0, 1]]))
+        q["c"] = [f1, sy * ow, (fz0 + pz1) / 2]
+        cuts.append(q)
+    if TRAY_BOT_CHAMFER:
+        cuts += [chamfer_x(sy * ow, fz0, bx0 - BOSS[1] - 1, f1 + 1, TRAY_BOT_CHAMFER) for sy in (1, -1)]
+    if TRAY_TOP_CHAMFER:
+        cuts.append(chamfer_y(bx0, pz1, -ow - 1, ow + 1, TRAY_TOP_CHAMFER))
+    # screws into the solid bridge: y inside its half-width, z inside its height and reachable from the pocket
+    zs = (max(bridge_z0 + 6.0, pz0 + 3.0), min(bridge_z1 - 6.0, pz1 - 3.0))
+    spots = [(sy * (bridge_hw - 5.5), z) for sy in (1, -1) for z in zs]
+    pilots = []
+    for y, z in spots:
+        cuts.append(cyl((0, y, z), X, M2_CLEAR / 2, f0 - 1, f1 + 1))
+        cuts.append(cyl((0, y, z), X, M2_HEAD[0] / 2, f0 - 1, f0 + M2_HEAD[1]))       # head counterbore
+        pilots.append(cyl((0, y, z), X, PILOT / 2, f1 - 1, f1 + 10))
+    # controller board bosses on the back wall, with M2 self-tapping pilots. The flat tray's back wall is too low
+    # for the board: it goes on a lid over the cells instead, once the board is chosen.
+    if TRAY_LAYOUT == "flat":
+        return solids, cuts, pilots
+    zc = (fz0 + pz1) / 2
+    for sy in (1, -1):
+        for sz in (1, -1):
+            y, z = sy * board[0] / 2, zc + sz * board[1] / 2
+            solids.append(cyl((0, y, z), X, BOSS[0] / 2, bx0 - BOSS[1], bx0 + 0.5))
+            cuts.append(cyl((0, y, z), X, PILOT / 2, bx0 - BOSS[1] - 1, bx0 + 0.5))
+    return solids, cuts, pilots
+
+
 def body():
     YL, YR, N = Servo("left_hip_yaw"), Servo("right_hip_yaw"), Servo("neck_pitch")
     HP, HY, HR = Servo("head_pitch"), Servo("head_yaw"), Servo("head_roll")
@@ -274,8 +364,10 @@ def body():
         q = box((-h, -h, z0 - 1), (h, h, deck_z1 + 1), R=np.array([[c45, -c45, 0], [c45, c45, 0], [0, 0, 1]]))
         q["c"] = [back_x, sy * lim, (z0 + deck_z1) / 2]
         cuts.append(q)
-    parts.append(part("trunk", "trunk", YL.cradle(top=False), YR.cradle(top=False), N.clevis(), (s, []), cuts=cuts,
-                      clip=clip))
+    tray, tray_cuts, trunk_pilots = battery_tray(back_x, inner, z0, z1, deck_z1)
+    parts.append(part("trunk", "trunk", YL.cradle(top=False), YR.cradle(top=False), N.clevis(), (s, []),
+                      cuts=cuts + trunk_pilots, clip=clip))
+    parts.append(part("battery_tray", "trunk", (tray, []), cuts=tray_cuts))
 
     # neck: cradles for the neck pitch servo (body forward-up) and the head pitch servo (body down), joined by a web
     yc = COVER_Z - CLR

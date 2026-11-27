@@ -5,6 +5,7 @@ Isaac Lab tasks for the STS3215 Microduck. Physics is Newton / MuJoCo-Warp; Isaa
 | Task | What it trains |
 |---|---|
 | `Microduck-STS3215-Velocity-Flat` | walk on flat ground following forward, sideways and turn commands |
+| `Microduck-STS3215-Velocity-Flat-Turn` | same, with a wider turn range (±0.8 rad/s), little reversing and fewer standing episodes |
 
 It starts from Isaac Lab's MicroDuck walking task (same observations, actions and rewards; the model uses the same
 body and joint names) and changes what differs for this robot:
@@ -101,3 +102,11 @@ or `--delay N` to apply every action N policy steps (20 ms each) late. It saves 
 ```bash
 uv run --with python-fcl python cad/sts3215/check_rom.py --traj <run>/eval/traj.npz
 ```
+
+## Turn variant
+
+The first BAM policy walks forward but ignores turn commands. `Microduck-STS3215-Velocity-Flat-Turn` trains the same
+task with a wider turn range (±0.8 rad/s, past the ±0.6 rad/s target), forward speed −0.05 to 0.25 m/s so that more
+samples walk while turning, and 10 % standing episodes. Its logs go to `microduck_sts3215_flat_turn`. Train and
+evaluate it with `--task Microduck-STS3215-Velocity-Flat-Turn` in the commands above. Its numbers are starting
+values and have not been trained yet.
