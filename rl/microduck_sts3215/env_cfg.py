@@ -5,10 +5,13 @@ rewards and curriculum; the robot model uses the same body and joint names) and 
 
 - the model and servos (identified STS3215, 10-40 ms command delay, firmware target rate limit, gearbox play);
 - slower commands, foot heights and step timing scaled to the bigger robot;
+- tracking judged on the distance covered over a stride (the trunk sways as fast as this robot walks), with
+  tolerances scaled down with the command ranges, and a reward for progress along the command that standing still forfeits;
 - rewards for what the first run got wrong: torque, joint acceleration and landing-force penalties against
-  shaking and overheating servos, trunk height and a pose reward while walking against crouching, both feet down
-  when told to stand, a contact penalty for the thighs against the trunk and hip yaw servos, and an episode end
-  when a thigh touches the floor;
+  shaking and overheating servos, a penalty on targets flicking back and forth every step (all ramped in once
+  the gaits are learned), trunk height and a pose reward while walking against crouching, both feet down
+  when told to stand, a stronger joint limit penalty, a contact penalty for the thighs against the trunk and hip
+  yaw servos, and an episode end when a thigh touches the floor;
 - randomization of what isn't measured yet (servo friction, trunk and head mass).
 """
 
@@ -39,6 +42,9 @@ AIR_TIME = (0.18, 0.45)
 
 TRUNK_HEIGHT = STAND_HEIGHT - 0.008
 """Rewarded trunk frame height [m]: the stand pose, less a little knee bend for walking."""
+
+TRACKING_WINDOW = 0.6
+"""Time over which the distance covered is compared with the command [s]: about one stride."""
 
 LANDING_FORCE = 25.0
 """Foot force above which landing is penalized [N]: about 1.7 times the robot's weight."""
@@ -87,20 +93,50 @@ class Sts3215VelocityFlatEnvCfg(MicroDuckVelocityFlatEnvCfg):
         ranges.lin_vel_y = (-0.1, 0.1)
         ranges.ang_vel_z = (-0.6, 0.6)
 
+        # Tracking is judged on the distance covered over about a stride, not on the velocity at each instant: while
+        # stepping, the trunk's velocity swings by +-0.15 m/s and +-0.35 rad/s around its average, as much as the
+        # commands themselves, so instantaneous tracking paid a robot walking at the right pace less than one
+        # standing still, and every run ended up standing for the slow, backward, sideways and turning commands.
+        # The tolerances are scaled with the commands (original 0.15 m/s and 0.35 rad/s for +-0.4 m/s and +-1 rad/s).
+        tracked = {"command_name": "base_velocity", "window_s": TRACKING_WINDOW}
+        self.rewards.track_lin_vel = RewTerm(func=sts_mdp.track_distance_exp, weight=4.0, params={**tracked, "std": 0.10})
+        self.rewards.track_ang_vel = RewTerm(func=sts_mdp.track_turn_exp, weight=4.0, params={**tracked, "std": 0.25})
+        # and progress along the command pays up to 3 per second and axis, which standing still or stepping on the
+        # spot under a command to move gives up
+        self.rewards.progress = RewTerm(
+            func=sts_mdp.command_progress, weight=3.0, params={**tracked, "min_speed": 0.03, "min_turn": 0.1}
+        )
+
         target = SWING_HEIGHT + SOLE_TO_ANKLE
         self.rewards.foot_clearance.params["target_height"] = target
         self.rewards.foot_swing_height.params["target_height"] = target
         self.rewards.foot_swing_height.weight = -0.25 * (target / 0.02) ** 2
         self.rewards.air_time.params["threshold_min"], self.rewards.air_time.params["threshold_max"] = AIR_TIME
 
-        # effort: weights sized so the first run's gait costs about 0.2-0.7 per second each (tracking pays ~6.5)
-        self.rewards.joint_torques = RewTerm(func=base_mdp.joint_torques_l2, weight=-0.05, params={"asset_cfg": _SERVOS})
-        self.rewards.joint_acc = RewTerm(func=base_mdp.joint_acc_l2, weight=-1e-5, params={"asset_cfg": _SERVOS})
+        # Smoothness and effort come after the gait. The policy explores with noise on every target, and these terms
+        # penalize that noise: applied from the start they shrank it before a foot ever stayed in the air long enough
+        # to be rewarded, and the robot settled on standing still. So until iteration 1500 only the original task's
+        # light action rate penalty applies.
+        #
+        # effort: final weights sized so the first run's gait costs about 0.2-0.7 per second each (tracking pays ~6.5)
+        self.rewards.joint_torques = RewTerm(func=base_mdp.joint_torques_l2, weight=0.0, params={"asset_cfg": _SERVOS})
+        self.rewards.joint_acc = RewTerm(func=base_mdp.joint_acc_l2, weight=0.0, params={"asset_cfg": _SERVOS})
         self.rewards.landing_force = RewTerm(
-            func=base_mdp.contact_forces, weight=-0.1, params={"threshold": LANDING_FORCE, "sensor_cfg": _FOOT_SENSOR_CFG}
+            func=base_mdp.contact_forces, weight=0.0, params={"threshold": LANDING_FORCE, "sensor_cfg": _FOOT_SENSOR_CFG}
         )
+        for name, final in (("joint_torques", -0.05), ("joint_acc", -1e-5), ("landing_force", -0.1)):
+            setattr(self.curriculum, f"{name}_weight", _schedule(
+                f"rewards.{name}.weight", (1500, final / 3), (2250, 2 * final / 3), (3000, final)
+            ))
         self.curriculum.action_rate_weight = _schedule(
-            "rewards.action_rate_l2.weight", (500, -0.3), (1000, -0.6), (2000, -1.0), (3000, -1.5), (4000, -2.0)
+            "rewards.action_rate_l2.weight", (1500, -0.3), (2000, -0.6), (2500, -1.0), (3250, -1.5), (4000, -2.0)
+        )
+        # Targets flicking every step cost 0.42 per unit weight and second, a smooth gait 0.06 (last policy's
+        # actions), but exploration noise of std s costs 84 s^2: more than either until late in training (s is about
+        # 0.1 from iteration 4500). So this comes last and stays small.
+        self.rewards.action_flicker = RewTerm(func=sts_mdp.action_flicker_l2, weight=0.0)
+        self.curriculum.action_flicker_weight = _schedule(
+            "rewards.action_flicker.weight", (4500, -0.25), (5500, -0.5)
         )
 
         # posture: stand tall, stay near the stand pose while walking too, and keep both feet down when standing
@@ -115,6 +151,9 @@ class Sts3215VelocityFlatEnvCfg(MicroDuckVelocityFlatEnvCfg):
             weight=1.0,
             params={"command_name": "base_velocity", "sensor_cfg": _FOOT_SENSOR_CFG},
         )
+
+        # a joint held against its limit stalls its servo: the hip yaws sat there through a whole run at -1
+        self.rewards.dof_pos_limits.weight = -10.0
 
         # the thighs can rest on the floor, and kneeling on them with the feet in the air would collect the
         # step-timing reward

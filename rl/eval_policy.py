@@ -24,6 +24,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 import microduck_sts3215  # noqa: E402, F401  (registers the tasks)
+import isaaclab.utils.math as math_utils  # noqa: E402
 from isaaclab.app import launch_simulation  # noqa: E402
 from isaaclab_rl.entrypoints.backends import cli_args_rsl_rl as cli_args  # noqa: E402
 from isaaclab_rl.entrypoints.backends.play_rsl_rl import _parse_args, _resolve_checkpoint  # noqa: E402
@@ -62,6 +63,7 @@ def main(argv):
     seconds = ROBUST_SECONDS if robust else SECONDS
     args_cli = _parse_args(argv + ["--num_envs", str(n_envs)])
     env_cfg, agent_cfg = resolve_task_config(args_cli.task, args_cli.agent, play_mode=not robust)
+    schedules = vars(env_cfg.curriculum)
     if not robust:
         for name in ("base_velocity", "head_pose", "body_pose"):
             getattr(env_cfg.commands, name).resampling_time_range = (1e9, 1e9)
@@ -119,11 +121,19 @@ def main(argv):
                 vel_term.vel_command_b[:] = cmd
                 vel_term.is_standing_env[:] = cmd.abs().sum(dim=1) == 0
 
+        # reward weights as at the end of training: the last stage of each weight's schedule
+        rewards = base.reward_manager
+        for term in schedules.values():
+            address = getattr(term, "params", {}).get("address", "")
+            if address.startswith("rewards.") and address.endswith(".weight"):
+                cfg = rewards.get_term_cfg(address.split(".")[1])
+                cfg.weight = term.params["modify_params"]["stages"][-1][1]
+        forward = torch.tensor([[1.0, 0.0, 0.0]], device=base.device).expand(n_envs, 3)
         hold_commands()
         obs = env.get_observations()
         steps = int(seconds / base.step_dt)
         keys = ("q", "play", "action", "v_b", "w_b", "foot_z", "foot_f", "self_f", "root_pos", "root_quat", "grav_b",
-                "done", "cmd")
+                "done", "cmd", "reward", "yaw")
         log = {k: [] for k in keys}
         pending = []
         with torch.inference_mode():
@@ -146,6 +156,9 @@ def main(argv):
                 log["grav_b"].append(d.projected_gravity_b.torch.clone())
                 log["done"].append(dones.clone())
                 log["cmd"].append(base.command_manager.get_command("base_velocity").clone())
+                log["reward"].append(rewards._step_reward.clone())
+                heading = math_utils.quat_apply(d.root_link_quat_w.torch, forward)
+                log["yaw"].append(torch.atan2(heading[:, 1], heading[:, 0]))
         S = {k: torch.stack(v).cpu().numpy() for k, v in log.items()}  # (T, env, ...)
         S["tau_sub"] = torch.stack(sub["tau"][-steps * base.cfg.decimation:]).cpu().numpy()
         S["dq_sub"] = torch.stack(sub["dq"][-steps * base.cfg.decimation:]).cpu().numpy()
@@ -159,6 +172,8 @@ def main(argv):
             report_robust(S, base.step_dt)
             return
         report(S, joints, action_joints, default_q, base.step_dt, base.physics_dt)
+        report_distance(S, base.step_dt)
+        report_rewards(S, rewards.active_terms, base.step_dt)
         pairs = [f"{b}/{f}" for b in self_contact.body_names for f in ("trunk", "ankle_right")]
         w = slice(int(WARMUP_S / base.step_dt), None)
         print("\nself-contact by pair (share of steps over 1 N, all commands): " +
@@ -261,6 +276,39 @@ def report(S, joints, action_joints, default_q, dt, physics_dt):
     for i, name in enumerate(COMMANDS):
         off = np.degrees(S["q"][w, env_of(i)].mean((0, 1)) - default_q)
         print(f"{name:10s} " + " ".join(f"{off[joints.index(s)]:10.0f}" for s in show))
+
+
+def report_distance(S, dt):
+    """Where the robots got to, from their positions: the check that a policy is walking and not just scoring."""
+    w0 = int(WARMUP_S / dt)
+    pos, yaw, done = S["root_pos"][w0:, :, :2], S["yaw"][w0:], S["done"][w0:].astype(bool)
+    step = pos[1:] - pos[:-1]
+    c, s = np.cos(yaw[1:]), np.sin(yaw[1:])
+    ahead, left = c * step[..., 0] + s * step[..., 1], -s * step[..., 0] + c * step[..., 1]
+    turn = (yaw[1:] - yaw[:-1] + np.pi) % (2 * np.pi) - np.pi
+    keep = ~done[1:]  # a robot that fell is put back at its start
+    seconds = (len(pos) - 1) * dt
+    print(f"\n6. distance covered in {seconds:.0f} s, from positions (asked -> covered, and the share of the command)")
+    print(f"{'command':10s} {'ahead [m]':>16s} {'left [m]':>16s} {'turned [deg]':>16s}   share")
+    for i, (name, cmd) in enumerate(COMMANDS.items()):
+        e = slice(i * REPEAT, (i + 1) * REPEAT)
+        got = [(x[:, e] * keep[:, e]).sum(0).mean() for x in (ahead, left, turn)]
+        asked = [v * seconds for v in cmd]
+        share = [f"{g / a:4.0%}" for g, a in zip(got, asked) if a]
+        print(f"{name:10s} {asked[0]:6.2f} -> {got[0]:6.2f} {asked[1]:6.2f} -> {got[1]:6.2f} "
+              f"{np.degrees(asked[2]):6.0f} -> {np.degrees(got[2]):6.0f}   {' '.join(share) or '-'}")
+
+
+def report_rewards(S, terms, dt):
+    """Reward each term pays per second at the final weights, per command: what the policy is choosing between."""
+    w = slice(int(WARMUP_S / dt), None)
+    rate = S["reward"][w].mean(axis=0).reshape(len(COMMANDS), REPEAT, -1).mean(axis=1)  # (command, term)
+    print("\n7. reward per second at the final weights, per command")
+    print(f"{'term':<22}" + "".join(f"{n:>10}" for n in COMMANDS))
+    for k, term in enumerate(terms):
+        if np.abs(rate[:, k]).max() >= 0.02:
+            print(f"{term:<22}" + "".join(f"{v:>10.2f}" for v in rate[:, k]))
+    print(f"{'total':<22}" + "".join(f"{v:>10.2f}" for v in rate.sum(axis=1)))
 
 
 def report_robust(S, dt):
